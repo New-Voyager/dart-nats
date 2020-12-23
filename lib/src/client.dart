@@ -8,7 +8,6 @@ import 'package:dart_nats/dart_nats.dart';
 import 'common.dart';
 import 'message.dart';
 import 'subscription.dart';
-import 'healthcheck.dart';
 
 enum _ReceiveState {
   idle, //op=msg -> msg
@@ -55,14 +54,11 @@ class Client {
   Completer _connectCompleter;
 
   ///status of the client
-  static var status = Status.disconnected;
-  Healthcheck _healthcheck = Healthcheck(status);
+  var status = Status.disconnected;
   var _connectOption = ConnectOption(verbose: false);
 
   ///server info
   Info get info => _info;
-  ///connection status
-  Healthcheck get healthcheck => _healthcheck;
 
   final _subs = <int, Subscription>{};
   final _backendSubs = <int, bool>{};
@@ -90,10 +86,8 @@ class Client {
       for (var i = 0; i == 0 || retry; i++) {
         if (i == 0) {
           status = Status.connecting;
-          _healthcheck.add(status);
         } else {
           status = Status.reconnecting;
-          _healthcheck.add(status);
           await Future.delayed(Duration(seconds: retryInterval));
         }
 
@@ -101,7 +95,6 @@ class Client {
           _socket = await Socket.connect(_host, _port,
               timeout: Duration(seconds: timeout));
           status = Status.connected;
-          _healthcheck.add(status);
           _connectCompleter.complete();
 
           _addConnectOption(_connectOption);
@@ -117,11 +110,9 @@ class Client {
             }
           }, onDone: () {
             status = Status.disconnected;
-            _healthcheck.add(status);
             _socket.close();
           }, onError: (err) {
             status = Status.disconnected;
-            _healthcheck.add(status);
             _socket.close();
           });
           return;
@@ -154,55 +145,62 @@ class Client {
   _ReceiveState _receiveState = _ReceiveState.idle;
   String _receiveLine1 = '';
   void _processOp() async {
-    ///find endline
-    var nextLineIndex = _buffer.indexWhere((c) {
-      if (c == 13) {
-        return true;
-      }
-      return false;
-    });
-    if (nextLineIndex == -1) return;
-    var line =
-        String.fromCharCodes(_buffer.sublist(0, nextLineIndex)); // retest
-    if (_buffer.length > nextLineIndex + 2) {
-      _buffer.removeRange(0, nextLineIndex + 2);
-    } else {
-      _buffer = [];
+    // we have got a chunk of data from previous message
+    if (_receiveLine1.length > 0) {
+      _processMsg();
     }
+    while (true) {
+        ///find endline
+        var nextLineIndex = _buffer.indexWhere((c) {
+          if (c == 13) {
+            return true;
+          }
+          return false;
+        });
+        if (nextLineIndex == -1) return;
+        
+         var line = String.fromCharCodes(_buffer.sublist(0, nextLineIndex)); // retest
 
-    ///decode operation
-    var i = line.indexOf(' ');
-    String op, data;
-    if (i != -1) {
-      op = line.substring(0, i).trim().toLowerCase();
-      data = line.substring(i).trim();
-    } else {
-      op = line.trim().toLowerCase();
-      data = '';
-    }
+        if (_buffer.length > nextLineIndex + 2) {
+          _buffer.removeRange(0, nextLineIndex + 2);
+        } else {
+          _buffer = [];
+        }
 
-    ///process operation
-    switch (op) {
-      case 'msg':
-        _receiveState = _ReceiveState.msg;
-        _receiveLine1 = line;
-        _processMsg();
-        break;
-      case 'info':
-        _info = Info.fromJson(jsonDecode(data));
-        break;
-      case 'ping':
-        _add('pong');
-        break;
-      case '-err':
-        _processErr(data);
-        break;
-      case 'pong':
-        _pingCompleter.complete();
-        break;
-      case '+ok':
-        //do nothing
-        break;
+        ///decode operation
+        var i = line.indexOf(' ');
+        String op, data;
+        if (i != -1) {
+          op = line.substring(0, i).trim().toLowerCase();
+          data = line.substring(i).trim();
+        } else {
+          op = line.trim().toLowerCase();
+          data = '';
+        }
+
+        ///process operation
+        switch (op) {
+          case 'msg':
+            _receiveState = _ReceiveState.msg;
+            _receiveLine1 = line;
+            _processMsg();
+            break;
+          case 'info':
+            _info = Info.fromJson(jsonDecode(data));
+            break;
+          case 'ping':
+            _add('pong');
+            break;
+          case '-err':
+            _processErr(data);
+            break;
+          case 'pong':
+            _pingCompleter.complete();
+            break;
+          case '+ok':
+          //do nothing
+            break;
+        }
     }
   }
 
@@ -222,7 +220,11 @@ class Client {
       replyTo = s[3];
       length = int.parse(s[4]);
     }
-    if (_buffer.length < length) return;
+    if (_buffer.length < length) {
+      //_prevMsgHeader = _receiveLine1
+      _receiveState = _ReceiveState.idle;
+      return;
+    }
     var payload = Uint8List.fromList(_buffer.sublist(0, length));
     // _buffer = _buffer.sublist(length + 2);
     if (_buffer.length > length + 2) {
@@ -393,6 +395,5 @@ class Client {
     _inboxs.clear();
     _socket?.close();
     status = Status.closed;
-    _healthcheck.add(status);
   }
 }
